@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Cadre Quote PDF → Excel Extractor</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Simple styling -->
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background: #f5f5f5;
+    }
+    .container {
+      max-width: 1100px;
+      margin: 30px auto;
+      background: #fff;
+      padding: 20px 30px 30px;
+      border-radius: 8px;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    }
+    h1 {
+      margin-top: 0;
+    }
+    .row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+    .col {
+      flex: 1 1 250px;
+      min-width: 240px;
+    }
+    label {
+      display: block;
+      font-size: 14px;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    input[type="text"],
+    input[type="email"] {
+      width: 100%;
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+      font-size: 14px;
+    }
+    input[type="file"] {
+      margin-top: 8px;
+    }
+    button {
+      background: #0078d4;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 10px 18px;
+      font-size: 14px;
+      cursor: pointer;
+      margin-right: 10px;
+    }
+    button:disabled {
+      background: #aaa;
+      cursor: default;
+    }
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      min-height: 20px;
+      white-space: pre-line;
+    }
+    .status.error {
+      color: #b00020;
+    }
+    .status.ok {
+      color: #006400;
+    }
+    .small {
+      font-size: 12px;
+      color: #555;
+    }
+    table.preview {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+      font-size: 12px;
+      max-height: 300px;
+      overflow-y: auto;
+      display: block;
+    }
+    table.preview thead {
+      position: sticky;
+      top: 0;
+      background: #eee;
+    }
+    table.preview th,
+    table.preview td {
+      border: 1px solid #ddd;
+      padding: 4px 6px;
+      text-align: left;
+    }
+  </style>
+
+  <!-- pdf.js (2.x classic build) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+  <!-- SheetJS (xlsx) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+</head>
+<body>
+<div class="container">
+  <h1>Cadre Quote PDF → Excel Extractor</h1>
+  <p>
+    Upload up to <strong>100 Cadre Wire quote PDFs</strong>. The tool will
+    read each PDF, extract quote header + line items, and download a single
+    Excel spreadsheet with one row per product line.
+  </p>
+
+  <div class="row">
+    <div class="col">
+      <label for="refManager">Referral Manager (optional)</label>
+      <input type="text" id="refManager" placeholder="" />
+    </div>
+    <div class="col">
+      <label for="refEmail">Referral Email</label>
+      <input type="email" id="refEmail" value="plawruk@cadrewire.com" />
+      <span class="small">Default based on your sample file – change if needed.</span>
+    </div>
+    <div class="col">
+      <label for="brand">Brand</label>
+      <input type="text" id="brand" value="Cadre Wire Group" />
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="col">
+      <label for="pdfFiles">Quote PDFs (max 100)</label>
+      <input type="file" id="pdfFiles" accept="application/pdf" multiple />
+      <span class="small">Files must have the same layout/format as your Cadre quote.</span>
+    </div>
+  </div>
+
+  <div class="row">
+    <button id="processBtn">Process PDFs</button>
+    <button id="downloadBtn" disabled>Download Excel</button>
+  </div>
+
+  <div id="status" class="status"></div>
+
+  <div id="previewWrapper"></div>
+</div>
+
+<script>
+  // ---------- CONFIG ----------
+  const TARGET_COLUMNS = [
+    "ReferralManager",
+    "ReferralEmail",
+    "Brand",
+    "QuoteNumber",
+    "QuoteDate",
+    "Company",
+    "FirstName",
+    "LastName",
+    "ContactEmail",
+    "ContactPhone",
+    "Address",
+    "County",
+    "City",
+    "State",
+    "ZipCode",
+    "Country",
+    "item_id",
+    "item_desc",
+    "UnitPrice",
+    "TotalSales",
+    "QuoteValidDate",
+    "CustomerNumber",
+    "manufacturer_Name",
+    "PDF",
+    "DemoQuote",
+  ];
+
+  const statusEl = document.getElementById("status");
+  const processBtn = document.getElementById("processBtn");
+  const downloadBtn = document.getElementById("downloadBtn");
+  const pdfInput = document.getElementById("pdfFiles");
+
+  let parsedRows = []; // will hold all rows after processing
+
+  // pdf.js worker configuration
+  if (window["pdfjsLib"]) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js";
+  }
+
+  function setStatus(msg, isError = false) {
+    statusEl.textContent = msg || "";
+    statusEl.className = "status " + (isError ? "error" : "ok");
+  }
+
+  function appendStatus(msg) {
+    statusEl.textContent += msg;
+  }
+
+  // ---------- PDF TEXT EXTRACTION ----------
+
+  async function extractFullText(arrayBuffer) {
+    const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
+    const pdf = await loadingTask.promise;
+    let fullText = "";
+
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      const strings = content.items.map((item) => item.str);
+      fullText += strings.join(" ") + "\n";
+    }
+    return fullText;
+  }
+
+  // ---------- HEADER PARSING ----------
+
+  function extractHeaderInfo(fullText) {
+    const header = {};
+
+    // Quote number + date: "Quote 120987 Date 11/24/2025"
+    let m = fullText.match(/Quote\s+(\d+)\s+Date\s+(\d{1,2}\/\d{1,2}\/\d{4})/);
+    if (m) {
+      header.QuoteNumber = m[1];
+      header.QuoteDate = m[2];
+    }
+
+    // Customer: "Customer 100725"
+    m = fullText.match(/Customer\s+(\d+)/);
+    if (m) {
+      header.CustomerNumber = m[1];
+    }
+
+    // Contact: "Contact Mike Shafer"
+    m = fullText.match(/Contact\s+([A-Za-z .'-]+)/);
+    if (m) {
+      const name = m[1].trim();
+      const parts = name.split(/\s+/);
+      if (parts.length >= 2) {
+        header.FirstName = parts[0];
+        header.LastName = parts.slice(1).join(" ");
+      } else if (parts.length === 1) {
+        header.FirstName = parts[0];
+      }
+    }
+
+    // Address block between "Quoted For:" and "Quote Good Through"
+    const qForIndex = fullText.indexOf("Quoted For:");
+    const qGoodIndex = fullText.indexOf("Quote Good Through");
+    if (qForIndex !== -1 && qGoodIndex !== -1 && qGoodIndex > qForIndex) {
+      const addrBlock = fullText.substring(qForIndex, qGoodIndex);
+
+      // Company between "Quoted For:" and "Ship To:"
+      m = addrBlock.match(/Quoted For:\s*(.+?)\s+Ship To:/);
+      if (m) {
+        header.Company = m[1].trim();
+      }
+
+      // Address: first street address before the second one
+      m = addrBlock.match(
+        /(\d{3,6}\s+[A-Za-z0-9 .]+?)\s+\d{3,6}\s+[A-Za-z0-9 ]+/
+      );
+      if (m) {
+        header.Address = m[1].trim();
+      }
+
+      // City, State, Zip: e.g. "Akron, OH 44306 Akron, OH 44306"
+      m = addrBlock.match(
+        /([A-Za-z .]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?/
+      );
+      if (m) {
+        header.City = m[1].trim();
+        header.State = m[2];
+        header.ZipCode = m[3];
+      }
+
+      if (addrBlock.includes("United States of America")) {
+        header.Country = "USA";
+      }
+    }
+
+    // Quote valid date
+    m = fullText.match(/Quote Good Through\s+(\d{1,2}\/\d{1,2}\/\d{4})/);
+    if (m) {
+      header.QuoteValidDate = m[1];
+    }
+
+    return header;
+  }
+
+  // ---------- LINE ITEM PARSING ----------
+
+  function extractLineItems(fullText) {
+    const items = [];
+    const pattern =
+      /^(\d+)\s+([A-Z0-9.\-]+)\s+(\d+)\s+EAC\s+([\d,]+\.\d+)\s*EAC\s+([\d,]+\.\d{2})/gm;
+
+    const matches = [];
+    let m;
+    while ((m = pattern.exec(fullText)) !== null) {
+      matches.push({
+        index: m.index,
+        text: m[0],
+        line_no: m[1],
+        item_id: m[2],
+        qty: m[3],
+        unit_price: m[4],
+        total: m[5],
+      });
+    }
+
+    for (let i = 0; i < matches.length; i++) {
+      const cur = matches[i];
+      const next = matches[i + 1];
+
+      let startDesc = cur.index + cur.text.length;
+      let endDesc;
+
+      if (next) {
+        endDesc = next.index;
+      } else {
+        // Until "Product" summary or end of text
+        const idx = fullText.indexOf("Product", startDesc);
+        endDesc = idx === -1 ? fullText.length : idx;
+      }
+
+      let desc = fullText.substring(startDesc, endDesc).trim();
+      // Collapse whitespace
+      desc = desc.replace(/\s+/g, " ");
+
+      items.push({
+        line_no: cur.line_no,
+        item_id: cur.item_id,
+        qty: cur.qty,
+        unit_price: cur.unit_price,
+        total: cur.total,
+        description: desc,
+      });
+    }
+
+    return items;
+  }
+
+  // ---------- BUILD ROWS PER PDF ----------
+
+  function buildRowsForPdf(fullText, fileName, defaults) {
+    const header = extractHeaderInfo(fullText);
+    const items = extractLineItems(fullText);
+    const rows = [];
+
+    items.forEach((it) => {
+      const row = {
+        ReferralManager: defaults.referralManager || null,
+        ReferralEmail: defaults.referralEmail || null,
+        Brand: defaults.brand || null,
+        QuoteNumber: header.QuoteNumber || null,
+        QuoteDate: header.QuoteDate || null,
+        Company: header.Company || null,
+        FirstName: header.FirstName || null,
+        LastName: header.LastName || null,
+        ContactEmail: null,
+        ContactPhone: null,
+        Address: header.Address || null,
+        County: null,
+        City: header.City || null,
+        State: header.State || null,
+        ZipCode: header.ZipCode || null,
+        Country: header.Country || null,
+        item_id: it.item_id,
+        item_desc: it.description,
+        UnitPrice: it.unit_price ? parseFloat(it.unit_price.replace(/,/g, "")) : null,
+        TotalSales: it.total ? parseFloat(it.total.replace(/,/g, "")) : null,
+        QuoteValidDate: header.QuoteValidDate || null,
+        CustomerNumber: header.CustomerNumber || null,
+        manufacturer_Name: null,
+        PDF: fileName,
+        DemoQuote: null,
+      };
+      rows.push(row);
+    });
+
+    return rows;
+  }
+
+  // ---------- PREVIEW TABLE ----------
+
+  function renderPreview(rows) {
+    const wrapper = document.getElementById("previewWrapper");
+    wrapper.innerHTML = "";
+
+    if (!rows.length) return;
+
+    const table = document.createElement("table");
+    table.className = "preview";
+
+    const thead = document.createElement("thead");
+    const trHead = document.createElement("tr");
+    TARGET_COLUMNS.forEach((col) => {
+      const th = document.createElement("th");
+      th.textContent = col;
+      trHead.appendChild(th);
+    });
+    thead.appendChild(trHead);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    const maxRows = Math.min(rows.length, 30); // show first 30 rows
+    for (let i = 0; i < maxRows; i++) {
+      const r = rows[i];
+      const tr = document.createElement("tr");
+      TARGET_COLUMNS.forEach((col) => {
+        const td = document.createElement("td");
+        const val = r[col];
+        td.textContent = val === undefined || val === null ? "" : String(val);
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    }
+    table.appendChild(tbody);
+    wrapper.appendChild(table);
+  }
+
+  // ---------- EXCEL EXPORT ----------
+
+  function downloadExcel(rows) {
+    const wsData = rows.map((row) => {
+      const obj = {};
+      TARGET_COLUMNS.forEach((col) => {
+        obj[col] = row[col] === undefined ? null : row[col];
+      });
+      return obj;
+    });
+
+    const ws = XLSX.utils.json_to_sheet(wsData, { header: TARGET_COLUMNS });
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Quotes");
+    XLSX.writeFile(wb, "quotes_extracted.xlsx");
+  }
+
+  // ---------- MAIN PROCESSING ----------
+
+  processBtn.addEventListener("click", async () => {
+    const files = Array.from(pdfInput.files || []);
+
+    if (!files.length) {
+      setStatus("Please select at least one PDF file to process.", true);
+      return;
+    }
+    if (files.length > 100) {
+      setStatus("Please upload 100 PDFs or fewer at a time.", true);
+      return;
+    }
+
+    const defaults = {
+      referralManager: document.getElementById("refManager").value.trim(),
+      referralEmail: document.getElementById("refEmail").value.trim(),
+      brand: document.getElementById("brand").value.trim(),
+    };
+
+    parsedRows = [];
+    downloadBtn.disabled = true;
+    setStatus("Processing PDFs...\n");
+    processBtn.disabled = true;
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      appendStatus(`\n[${i + 1}/${files.length}] ${file.name} ... `);
+
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        const text = await extractFullText(arrayBuffer);
+        const rows = buildRowsForPdf(text, file.name, defaults);
+        parsedRows.push(...rows);
+        appendStatus("OK");
+      } catch (err) {
+        console.error(err);
+        appendStatus("ERROR");
+      }
+    }
+
+    processBtn.disabled = false;
+
+    if (!parsedRows.length) {
+      setStatus(
+        "Finished, but no line items were found. Make sure the PDFs have the Cadre quote layout.",
+        true
+      );
+      return;
+    }
+
+    setStatus(
+      `Done. Parsed ${files.length} PDF(s) with ${parsedRows.length} total line item rows.`
+    );
+    renderPreview(parsedRows);
+    downloadBtn.disabled = false;
+  });
+
+  downloadBtn.addEventListener("click", () => {
+    if (!parsedRows.length) return;
+    downloadExcel(parsedRows);
+  });
+</script>
+</body>
+</html>
