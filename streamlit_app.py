@@ -1,13 +1,12 @@
 import io
 import re
+from datetime import datetime
 from typing import List, Dict, Optional
 
 import pdfplumber
 import pandas as pd
 import streamlit as st
 
-
-# ---------- CONFIG / TARGET COLUMNS ----------
 
 TARGET_COLUMNS = [
     "ReferralManager",
@@ -51,10 +50,7 @@ def extract_full_text(pdf_bytes: bytes) -> str:
 
 
 def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
-    """
-    Extract quote-level fields from the PDF header.
-    Designed for Cadre Wire quote layout.
-    """
+    """Extract quote-level fields from the header area."""
     header: Dict[str, Optional[str]] = {}
 
     # Quote number + date: "Quote 120987 Date 11/24/2025"
@@ -63,37 +59,39 @@ def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
         header["QuoteNumber"] = m_quote.group(1)
         header["QuoteDate"] = m_quote.group(2)
 
-    # Customer number: "Customer 100725"
+    # Customer number
     m_cust = re.search(r"Customer\s+(\d+)", full_text)
     if m_cust:
         header["CustomerNumber"] = m_cust.group(1)
 
-    # Contact: "Contact Mike Shafer"
+    # Contact name
     m_contact = re.search(r"Contact\s+([A-Za-z .'-]+)", full_text)
-    first_name = last_name = None
     if m_contact:
         name = m_contact.group(1).strip()
         parts = name.split()
         if len(parts) >= 2:
-            first_name = parts[0]
-            last_name = " ".join(parts[1:])
+            header["FirstName"] = parts[0]
+            header["LastName"] = " ".join(parts[1:])
         elif parts:
-            first_name = parts[0]
-    header["FirstName"] = first_name
-    header["LastName"] = last_name
+            header["FirstName"] = parts[0]
 
-    # Block between "Quoted For:" and "Quote Good Through"
+    # Salesperson -> ReferralManager
+    m_sales = re.search(r"Salesperson\s+([A-Za-z .'-]+)", full_text)
+    if m_sales:
+        header["ReferralManager"] = m_sales.group(1).strip()
+
+    # Address block between Quoted For and Quote Good Through
     if "Quoted For:" in full_text and "Quote Good Through" in full_text:
         start = full_text.index("Quoted For:")
         end = full_text.index("Quote Good Through")
         addr_block = full_text[start:end]
 
-        # Company name between "Quoted For:" and "Ship To:"
+        # Company name
         m_company = re.search(r"Quoted For:\s*(.+?)\s+Ship To:", addr_block)
         if m_company:
             header["Company"] = m_company.group(1).strip()
 
-        # Street address: first address before the second one
+        # Street address - first address in the block
         m_addr = re.search(
             r"(\d{3,6}\s+[A-Za-z0-9 .]+?)\s+\d{3,6}\s+[A-Za-z0-9 ]+",
             addr_block,
@@ -101,7 +99,7 @@ def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
         if m_addr:
             header["Address"] = m_addr.group(1).strip()
 
-        # City, state, zip: e.g. "Akron, OH 44306 Akron, OH 44306"
+        # City, state, zip
         m_city = re.search(
             r"([A-Za-z .]+),\s*([A-Z]{2})\s+(\d{5})(?:-\d{4})?",
             addr_block,
@@ -111,11 +109,10 @@ def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
             header["State"] = m_city.group(2)
             header["ZipCode"] = m_city.group(3)
 
-        # Country
         if "United States of America" in addr_block:
             header["Country"] = "USA"
 
-    # Quote valid date: "Quote Good Through 12/09/2025"
+    # Quote valid date
     m_valid = re.search(r"Quote Good Through\s+(\d{1,2}/\d{1,2}/\d{4})", full_text)
     if m_valid:
         header["QuoteValidDate"] = m_valid.group(1)
@@ -124,39 +121,37 @@ def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
 
 
 def extract_line_items(full_text: str) -> List[Dict[str, str]]:
-    """
-    Extract all line items from the body.
-    Matches lines like:
-    '1 HW.MAGFOOT-170 27 EAC 3,600.00000EAC 97,200.00'
-    and pulls description text until the next item.
-    """
-    pattern = re.compile(
-        r"(?m)^(\d+)\s+([A-Z0-9.\-]+)\s+(\d+)\s+EAC\s+([\d,]+\.\d+)\s*EAC\s+([\d,]+\.\d{2})"
-    )
-    matches = list(pattern.finditer(full_text))
+    """Extract all line items based on per-line parsing.
 
+    We look for lines like:
+    '1 COP2.750.BLACK 100 FT 33,500.00000 MFT 3,350.00'
+    or
+    '1 HW.MAGFOOT-170 27 EAC 3,600.00000EAC 97,200.00'
+    and then take the *next* line as the description.
+    """
     items: List[Dict[str, str]] = []
 
-    for i, m in enumerate(matches):
+    lines = [ln.strip() for ln in full_text.splitlines()]
+
+    pattern = re.compile(
+        r"^(\d+)\s+([A-Z0-9.\-]+)\s+(\d+)\s+[A-Z/]+\s+([\d,]+\.\d+)\s*[A-Z/]+\s+([\d,]+\.\d{2})$"
+    )
+
+    for idx, line in enumerate(lines):
+        m = pattern.match(line)
+        if not m:
+            continue
+
         line_no = m.group(1)
         item_id = m.group(2)
         qty = m.group(3)
         unit_price = m.group(4)
         total = m.group(5)
 
-        # Description = text between this match and the next match
-        start_desc = m.end()
-        if i + 1 < len(matches):
-            end_desc = matches[i + 1].start()
-        else:
-            # Stop before summary like "Product 123,390.00"
-            stop_word = "Product"
-            end_desc = full_text.find(stop_word, start_desc)
-            if end_desc == -1:
-                end_desc = len(full_text)
-
-        desc_raw = full_text[start_desc:end_desc].strip()
-        desc_clean = " ".join(desc_raw.split())  # collapse whitespace
+        # Description = the very next non-empty line after this line
+        description = ""
+        if idx + 1 < len(lines):
+            description = lines[idx + 1].strip()
 
         items.append(
             {
@@ -165,31 +160,50 @@ def extract_line_items(full_text: str) -> List[Dict[str, str]]:
                 "qty": qty,
                 "unit_price": unit_price,
                 "total": total,
-                "description": desc_clean,
+                "description": description,
             }
         )
 
     return items
 
 
+def normalize_date_str(date_str: Optional[str]) -> Optional[str]:
+    """Return date as mm/dd/yyyy string, kept as TEXT for Excel."""
+    if not date_str:
+        return None
+    try:
+        dt = datetime.strptime(date_str, "%m/%d/%Y")
+        formatted = dt.strftime("%m/%d/%Y")
+        # leading apostrophe so Excel treats as text
+        return f"'{formatted}"
+    except Exception:
+        # fallback: still prefix apostrophe to keep as text
+        return f"'{date_str}"
+
+
 def build_rows_for_pdf(
     pdf_bytes: bytes,
     filename: str,
-    referral_manager: Optional[str],
-    referral_email: str,
-    brand: str,
+    fallback_referral_manager: Optional[str],
+    referral_email: Optional[str],
+    brand: Optional[str],
 ) -> List[Dict]:
-    """
-    Parse one PDF and return a list of row dicts following TARGET_COLUMNS.
-    """
+    """Parse one PDF and return a list of row dicts following TARGET_COLUMNS."""
     full_text = extract_full_text(pdf_bytes)
     header = extract_header_info(full_text)
     items = extract_line_items(full_text)
 
     rows: List[Dict] = []
 
+    # Prepare text-form quote fields
+    qn = header.get("QuoteNumber")
+    quote_number_text = f"'{qn}" if qn is not None else None
+    quote_date_text = normalize_date_str(header.get("QuoteDate"))
+    quote_valid_text = normalize_date_str(header.get("QuoteValidDate"))
+
+    referral_manager = header.get("ReferralManager") or fallback_referral_manager or None
+
     for it in items:
-        # Convert numeric strings to floats for Excel
         try:
             unit_price_val = float(it["unit_price"].replace(",", ""))
         except Exception:
@@ -201,11 +215,11 @@ def build_rows_for_pdf(
             total_val = None
 
         row = {
-            "ReferralManager": referral_manager or None,
+            "ReferralManager": referral_manager,
             "ReferralEmail": referral_email or None,
             "Brand": brand or None,
-            "QuoteNumber": header.get("QuoteNumber"),
-            "QuoteDate": header.get("QuoteDate"),
+            "QuoteNumber": quote_number_text,
+            "QuoteDate": quote_date_text,
             "Company": header.get("Company"),
             "FirstName": header.get("FirstName"),
             "LastName": header.get("LastName"),
@@ -221,7 +235,7 @@ def build_rows_for_pdf(
             "item_desc": it["description"],
             "UnitPrice": unit_price_val,
             "TotalSales": total_val,
-            "QuoteValidDate": header.get("QuoteValidDate"),
+            "QuoteValidDate": quote_valid_text,
             "CustomerNumber": header.get("CustomerNumber"),
             "manufacturer_Name": None,
             "PDF": filename,
@@ -232,7 +246,7 @@ def build_rows_for_pdf(
     return rows
 
 
-# ---------- STREAMLIT APP ----------
+# ---------- STREAMLIT UI ----------
 
 st.set_page_config(page_title="Cadre Quote PDF → Excel", layout="wide")
 
@@ -243,18 +257,21 @@ st.markdown(
 Upload Cadre Wire quote PDFs and download all line items in a single Excel file.
 
 - Supports up to **100 PDFs** per run.  
-- Designed for the **same layout and alignment** as your sample Cadre quote.  
+- Designed for the **same layout and alignment** as Cadre quotes.  
 - Each product line item becomes its own row in Excel.
 """
 )
 
 with st.sidebar:
-    st.header("Defaults / Mapping")
-    referral_manager = st.text_input("Referral Manager (optional)", value="")
+    st.header("Optional Defaults")
+    fallback_referral_manager = st.text_input(
+        "Fallback Referral Manager (used only if PDF has no Salesperson)",
+        value="",
+    )
     referral_email = st.text_input(
-        "Referral Email",
-        value="plawruk@cadrewire.com",
-        help="Used in the ReferralEmail column of the Excel output.",
+        "Referral Email (optional)",
+        value="",
+        help="If provided, this goes into the ReferralEmail column.",
     )
     brand = st.text_input("Brand", value="Cadre Wire Group")
 
@@ -284,7 +301,7 @@ if process:
                 rows = build_rows_for_pdf(
                     pdf_bytes=pdf_bytes,
                     filename=f.name,
-                    referral_manager=referral_manager,
+                    fallback_referral_manager=fallback_referral_manager,
                     referral_email=referral_email,
                     brand=brand,
                 )
@@ -304,7 +321,6 @@ if process:
             st.subheader("Preview (first 50 rows)")
             st.dataframe(df.head(50), use_container_width=True)
 
-            # Excel download
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False, sheet_name="Quotes")
