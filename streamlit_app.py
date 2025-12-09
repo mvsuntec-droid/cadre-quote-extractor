@@ -1,6 +1,4 @@
-import io
-import re
-from typing import List, Dict, Optional
+
 
 import pdfplumber
 import pandas as pd
