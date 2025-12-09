@@ -6,6 +6,7 @@ from typing import List, Dict, Optional
 import pdfplumber
 import pandas as pd
 import streamlit as st
+import zipfile
 
 
 TARGET_COLUMNS = [
@@ -121,12 +122,12 @@ def extract_header_info(full_text: str) -> Dict[str, Optional[str]]:
 
 
 def extract_line_items(full_text: str) -> List[Dict[str, str]]:
-    """Extract all line items based on per-line parsing.
+    """Extract all normal line items based on per-line parsing.
 
     We look for lines like:
     '1 COP2.750.BLACK 100 FT 33,500.00000 MFT 3,350.00'
     or
-    '1 HW.MAGFOOT-170 27 EAC 3,600.00000EAC 97,200.00'
+    '1 HW.MAGFOOT-170 27 EAC 3,600.00000 EAC 97,200.00'
     and then take the *next* line as the description.
     """
     items: List[Dict[str, str]] = []
@@ -167,18 +168,47 @@ def extract_line_items(full_text: str) -> List[Dict[str, str]]:
     return items
 
 
+def extract_tax_item(full_text: str) -> Optional[Dict[str, str]]:
+    """Extract Tax as a separate line item from the summary area, if non-zero."""
+    block = full_text
+    if "Product" in full_text and "Total" in full_text:
+        start = full_text.index("Product")
+        end = full_text.index("Total", start)
+        block = full_text[start:end]
+
+    m = re.search(r"\bTax\s+([\d,]+\.\d{2})", block)
+    if not m:
+        return None
+
+    amount_str = m.group(1)
+    try:
+        val = float(amount_str.replace(",", ""))
+    except Exception:
+        return None
+
+    if abs(val) < 0.005:
+        # Tax is effectively zero -> ignore
+        return None
+
+    return {
+        "line_no": "TAX",
+        "item_id": "Tax",
+        "qty": "1",
+        "unit_price": amount_str,
+        "total": amount_str,
+        "description": "Tax",
+    }
+
+
 def normalize_date_str(date_str: Optional[str]) -> Optional[str]:
-    """Return date as mm/dd/yyyy string, kept as TEXT for Excel."""
+    """Return date as mm/dd/yyyy string (no special characters)."""
     if not date_str:
         return None
     try:
         dt = datetime.strptime(date_str, "%m/%d/%Y")
-        formatted = dt.strftime("%m/%d/%Y")
-        # leading apostrophe so Excel treats as text
-        return f"'{formatted}"
+        return dt.strftime("%m/%d/%Y")
     except Exception:
-        # fallback: still prefix apostrophe to keep as text
-        return f"'{date_str}"
+        return date_str
 
 
 def build_rows_for_pdf(
@@ -193,11 +223,14 @@ def build_rows_for_pdf(
     header = extract_header_info(full_text)
     items = extract_line_items(full_text)
 
+    # Append Tax line item if present and non-zero
+    tax_item = extract_tax_item(full_text)
+    if tax_item:
+        items.append(tax_item)
+
     rows: List[Dict] = []
 
-    # Prepare text-form quote fields
-    qn = header.get("QuoteNumber")
-    quote_number_text = f"'{qn}" if qn is not None else None
+    quote_number_text = header.get("QuoteNumber")
     quote_date_text = normalize_date_str(header.get("QuoteDate"))
     quote_valid_text = normalize_date_str(header.get("QuoteValidDate"))
 
@@ -290,50 +323,72 @@ if process:
     elif len(uploaded_files) > 100:
         st.error("Please upload 100 PDFs or fewer at a time.")
     else:
+        # Read all files once so we can both parse and offer a ZIP download
+        file_data: List[Dict[str, bytes]] = []
+        for f in uploaded_files:
+            pdf_bytes = f.read()
+            file_data.append({"name": f.name, "bytes": pdf_bytes})
+
         all_rows: List[Dict] = []
         progress = st.progress(0.0)
         status = st.empty()
 
-        for idx, f in enumerate(uploaded_files, start=1):
-            status.text(f"Processing {idx}/{len(uploaded_files)}: {f.name}")
-            pdf_bytes = f.read()
+        for idx, fd in enumerate(file_data, start=1):
+            name = fd["name"]
+            pdf_bytes = fd["bytes"]
+            status.text(f"Processing {idx}/{len(file_data)}: {name}")
             try:
                 rows = build_rows_for_pdf(
                     pdf_bytes=pdf_bytes,
-                    filename=f.name,
+                    filename=name,
                     fallback_referral_manager=fallback_referral_manager,
                     referral_email=referral_email,
                     brand=brand,
                 )
                 all_rows.extend(rows)
             except Exception as e:
-                st.warning(f"Error processing {f.name}: {e}")
-            progress.progress(idx / len(uploaded_files))
+                st.warning(f"Error processing {name}: {e}")
+            progress.progress(idx / len(file_data))
 
         if not all_rows:
             st.error("No line items were found in the uploaded PDFs.")
         else:
             df = pd.DataFrame(all_rows, columns=TARGET_COLUMNS)
             st.success(
-                f"Parsed {len(uploaded_files)} PDF(s) with {len(df)} total line items."
+                f"Parsed {len(file_data)} PDF(s) with {len(df)} total line items."
             )
 
             st.subheader("Preview (first 50 rows)")
             st.dataframe(df.head(50), use_container_width=True)
 
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            # Excel download
+            excel_buf = io.BytesIO()
+            with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
                 df.to_excel(writer, index=False, sheet_name="Quotes")
-            output.seek(0)
+            excel_buf.seek(0)
 
             st.download_button(
                 label="Download Excel Spreadsheet",
-                data=output,
+                data=excel_buf,
                 file_name="quotes_extracted.xlsx",
                 mime=(
                     "application/vnd.openxmlformats-officedocument."
                     "spreadsheetml.sheet"
                 ),
+            )
+
+            # ZIP of PDFs with same names as in the Excel 'PDF' column
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fd in file_data:
+                    zf.writestr(fd["name"], fd["bytes"])
+            zip_buf.seek(0)
+
+            st.download_button(
+                label="Download Uploaded PDFs (ZIP)",
+                data=zip_buf,
+                file_name="quotes_pdfs.zip",
+                mime="application/zip",
             )
 else:
     st.info("Upload PDFs and click **Process PDFs** to start.")
